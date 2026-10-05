@@ -1,7 +1,25 @@
+--!optimize 2
+--!native
+
 local UserInputService = game:GetService("UserInputService")
 local GuiService = game:GetService("GuiService")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
+
+local MathMin = math.min
+local MathMax = math.max
+local MathAbs = math.abs
+local MathClamp = math.clamp
+local MathExp = math.exp
+local MathRound = math.round
+local MathDeg = math.deg
+local MathAtan2 = math.atan2
+local TableClear = table.clear
+local TableInsert = table.insert
+local TableClone = table.clone
+local OsClock = os.clock
+local Vector2New = Vector2.new
+local UDim2New = UDim2.new
 
 export type GestureHandle = {
 	Disconnect: (self: GestureHandle) -> (),
@@ -137,9 +155,9 @@ export type UIGesture = {
 
 local UIGesture = {} :: UIGesture
 
-local InputChangedListeners = {}
-local InputEndedListeners = {}
-local FocusLostListeners = {}
+local MoveHub = { Listeners = {}, Signal = UserInputService.InputChanged }
+local EndHub = { Listeners = {}, Signal = UserInputService.InputEnded }
+local FocusHub = { Listeners = {}, Signal = UserInputService.WindowFocusReleased }
 
 local function IsDragMovement(input, ActiveInput)
 	if not ActiveInput then
@@ -158,12 +176,6 @@ local function IsPress(input, Button)
 		and (input.UserInputType == (Button or Enum.UserInputType.MouseButton1) or input.UserInputType == Enum.UserInputType.Touch)
 end
 
-local function Call(Fn, ...)
-	if Fn then
-		Fn(...)
-	end
-end
-
 local function Setup(Name, Main, Handle)
 	Main = Main or Handle
 	Handle = Handle or Main
@@ -179,7 +191,7 @@ local function SafeClamp(Value, Min, Max)
 		return Min
 	end
 
-	return math.clamp(Value, Min, Max)
+	return MathClamp(Value, Min, Max)
 end
 
 local function Listen(Listeners, Fn)
@@ -197,10 +209,14 @@ local function DisconnectAll(Conn)
 end
 
 local function Bind(Self, Conn, Main, Handle)
-	for _, Target in { Main, Handle } do
-		table.insert(Conn, Target.Destroying:Connect(function()
-			Self:Disconnect()
-		end))
+	local function Destroy()
+		Self:Disconnect()
+	end
+
+	TableInsert(Conn, Main.Destroying:Connect(Destroy))
+
+	if Handle ~= Main then
+		TableInsert(Conn, Handle.Destroying:Connect(Destroy))
 	end
 
 	return Self
@@ -227,34 +243,6 @@ local function GetScreenBounds()
 	return 0, -Inset.Y, Size.X, Size.Y - Inset.Y
 end
 
-local function AddTouch(Touches, input)
-	if input.UserInputType ~= Enum.UserInputType.Touch or input.UserInputState ~= Enum.UserInputState.Begin then
-		return false
-	end
-
-	if not Touches[1] then
-		Touches[1] = input
-	elseif not Touches[2] then
-		Touches[2] = input
-	else
-		return false
-	end
-
-	return Touches[1] ~= nil and Touches[2] ~= nil
-end
-
-local function RemoveTouch(Touches, input)
-	if Touches[1] == input then
-		Touches[1] = nil
-	elseif Touches[2] == input then
-		Touches[2] = nil
-	else
-		return false
-	end
-
-	return true
-end
-
 local Spawn = (function()
 	local free, remove, insert, create, running, yield, spawn = {}, table.remove, table.insert, coroutine.create, coroutine.running, coroutine.yield, task.spawn
 
@@ -270,24 +258,69 @@ local Spawn = (function()
 end)()
 
 local function Dispatch(Listeners, input)
-	for Fn in table.clone(Listeners) do
+	if next(Listeners) == nil then return end
+
+	for Fn in TableClone(Listeners) do
 		if Listeners[Fn] then
 			Spawn(Fn, input)
 		end
 	end
 end
 
-UserInputService.InputChanged:Connect(function(input)
-	Dispatch(InputChangedListeners, input)
-end)
+local function Attach(Hub, Fn)
+	Hub.Listeners[Fn] = true
 
-UserInputService.InputEnded:Connect(function(input)
-	Dispatch(InputEndedListeners, input)
-end)
+	if not Hub.Conn then
+		Hub.Conn = Hub.Signal:Connect(function(input)
+			Dispatch(Hub.Listeners, input)
+		end)
+	end
+end
 
-UserInputService.WindowFocusReleased:Connect(function()
-	Dispatch(FocusLostListeners)
-end)
+local function Detach(Hub, Fn)
+	Hub.Listeners[Fn] = nil
+
+	if Hub.Conn and next(Hub.Listeners) == nil then
+		Hub.Conn:Disconnect()
+		Hub.Conn = nil
+	end
+end
+
+local function AddTouch(Touches, input, OnEnd, OnFocus)
+	if input.UserInputType ~= Enum.UserInputType.Touch or input.UserInputState ~= Enum.UserInputState.Begin then
+		return false
+	end
+
+	if not Touches[1] then
+		Touches[1] = input
+	elseif not Touches[2] then
+		Touches[2] = input
+	else
+		return false
+	end
+
+	Attach(EndHub, OnEnd)
+	Attach(FocusHub, OnFocus)
+
+	return Touches[1] ~= nil and Touches[2] ~= nil
+end
+
+local function RemoveTouch(Touches, input, OnEnd, OnFocus)
+	if Touches[1] == input then
+		Touches[1] = nil
+	elseif Touches[2] == input then
+		Touches[2] = nil
+	else
+		return false
+	end
+
+	if not Touches[1] and not Touches[2] then
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, OnFocus)
+	end
+
+	return true
+end
 
 function UIGesture:MakeDraggable(Main, Handle, Fn, Config)
 	Main, Handle = Setup("Draggable", Main, Handle)
@@ -305,14 +338,17 @@ function UIGesture:MakeDraggable(Main, Handle, Fn, Config)
 	local Locked = false
 	local PressId = 0
 	local ActiveInput, DragInput, DragStart, StartPos, StartAbsPos, LastScale
+	local DragScale, BoundMinX, BoundMinY, BoundMaxX, BoundMaxY
+
+	local OnEnd
 
 	local Conn = {}
 	local ScaleConn = {}
-	local self = {}
+	local Self = {}
 
 	local function WatchScales()
 		DisconnectAll(ScaleConn)
-		table.clear(ScaleConn)
+		TableClear(ScaleConn)
 
 		LastScale = GetAncestorScale(Main.Parent)
 
@@ -321,10 +357,10 @@ function UIGesture:MakeDraggable(Main, Handle, Fn, Config)
 		while Node do
 			local Found = Node:FindFirstChildOfClass("UIScale")
 			if Found then
-				table.insert(ScaleConn, Found:GetPropertyChangedSignal("Scale"):Connect(function()
+				TableInsert(ScaleConn, Found:GetPropertyChangedSignal("Scale"):Connect(function()
 					local NewScale = GetAncestorScale(Main.Parent)
 
-					Main.Position = UDim2.new(
+					Main.Position = UDim2New(
 						Main.Position.X.Scale,
 						Main.Position.X.Offset * LastScale / NewScale,
 						Main.Position.Y.Scale,
@@ -344,50 +380,35 @@ function UIGesture:MakeDraggable(Main, Handle, Fn, Config)
 		DragStart = Position
 		StartPos = Main.Position
 		StartAbsPos = Handle.AbsolutePosition
+		DragScale = GetAncestorScale(Main.Parent)
 
-		Call(Fn, true)
+		if Bounds ~= "None" then
+			local Left, Top, Right, Bottom
+
+			if typeof(Bounds) == "Instance" then
+				Left = (Bounds :: GuiObject).AbsolutePosition.X
+				Top = (Bounds :: GuiObject).AbsolutePosition.Y
+				Right = Left + (Bounds :: GuiObject).AbsoluteSize.X
+				Bottom = Top + (Bounds :: GuiObject).AbsoluteSize.Y
+			elseif typeof(Bounds) == "Rect" then
+				Left = Bounds.Min.X
+				Top = Bounds.Min.Y
+				Right = Bounds.Max.X
+				Bottom = Bounds.Max.Y
+			else
+				Left, Top, Right, Bottom = GetScreenBounds()
+			end
+
+			BoundMinX = Left + MathMin(0, Margin - Handle.AbsoluteSize.X)
+			BoundMinY = Top + MathMin(0, Margin - Handle.AbsoluteSize.Y)
+			BoundMaxX = MathMax(Right - Margin, Right - Handle.AbsoluteSize.X)
+			BoundMaxY = MathMax(Bottom - Margin, Bottom - Handle.AbsoluteSize.Y)
+		end
+
+		if Fn then Fn(true) end
 	end
 
-	local function Cancel()
-		dragging = false
-		Pending = false
-		ActiveInput = nil
-		DragInput = nil
-
-		if Activated then
-			Activated = false
-			Call(Fn, false)
-		end
-	end
-
-	Conn[1] = Handle.InputBegan:Connect(function(input)
-		if dragging or Pending or Locked or not IsPress(input) then return end
-
-		ActiveInput = input
-
-		if Threshold == 0 and not HoldTime then
-			Activate(input.Position)
-			return
-		end
-
-		Pending = true
-		DragStart = input.Position
-
-		if HoldTime then
-			PressId += 1
-			local Id = PressId
-
-			task.delay(HoldTime, function()
-				if Pending and PressId == Id then
-					Activate((DragInput or ActiveInput).Position)
-				end
-			end)
-		end
-	end)
-
-	Conn[2] = Listen(FocusLostListeners, Cancel)
-
-	Conn[3] = Listen(InputChangedListeners, function(input)
+	local function OnMove(input)
 		if IsDragMovement(input, ActiveInput) then
 			DragInput = input
 		end
@@ -416,53 +437,73 @@ function UIGesture:MakeDraggable(Main, Handle, Fn, Config)
 			local clampedAbsY = desiredAbsY
 
 			if Bounds ~= "None" then
-				local Left, Top, Right, Bottom
-
-				if typeof(Bounds) == "Instance" then
-					Left = Bounds.AbsolutePosition.X
-					Top = Bounds.AbsolutePosition.Y
-					Right = Left + Bounds.AbsoluteSize.X
-					Bottom = Top + Bounds.AbsoluteSize.Y
-				elseif typeof(Bounds) == "Rect" then
-					Left = Bounds.Min.X
-					Top = Bounds.Min.Y
-					Right = Bounds.Max.X
-					Bottom = Bounds.Max.Y
-				else
-					Left, Top, Right, Bottom = GetScreenBounds()
-				end
-
-				local minX = Left + math.min(0, Margin - Handle.AbsoluteSize.X)
-				local minY = Top + math.min(0, Margin - Handle.AbsoluteSize.Y)
-				local maxX = math.max(Right - Margin, Right - Handle.AbsoluteSize.X)
-				local maxY = math.max(Bottom - Margin, Bottom - Handle.AbsoluteSize.Y)
-
-				clampedAbsX = SafeClamp(desiredAbsX, minX, maxX)
-				clampedAbsY = SafeClamp(desiredAbsY, minY, maxY)
+				clampedAbsX = SafeClamp(desiredAbsX, BoundMinX, BoundMaxX)
+				clampedAbsY = SafeClamp(desiredAbsY, BoundMinY, BoundMaxY)
 			end
 
-			local Scale = GetAncestorScale(Main.Parent)
-
-			Main.Position = UDim2.new(
+			Main.Position = UDim2New(
 				StartPos.X.Scale,
-				StartPos.X.Offset + (clampedAbsX - StartAbsPos.X) / Scale,
+				StartPos.X.Offset + (clampedAbsX - StartAbsPos.X) / DragScale,
 				StartPos.Y.Scale,
-				StartPos.Y.Offset + (clampedAbsY - StartAbsPos.Y) / Scale
+				StartPos.Y.Offset + (clampedAbsY - StartAbsPos.Y) / DragScale
 			)
+		end
+	end
+
+	local function Cancel()
+		Detach(MoveHub, OnMove)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, Cancel)
+		dragging = false
+		Pending = false
+		ActiveInput = nil
+		DragInput = nil
+
+		if Activated then
+			Activated = false
+			if Fn then Fn(false) end
+		end
+	end
+
+	Conn[1] = Handle.InputBegan:Connect(function(input)
+		if dragging or Pending or Locked or not IsPress(input) then return end
+
+		ActiveInput = input
+		Attach(MoveHub, OnMove)
+		Attach(EndHub, OnEnd)
+		Attach(FocusHub, Cancel)
+
+		if Threshold == 0 and not HoldTime then
+			Activate(input.Position)
+			return
+		end
+
+		Pending = true
+		DragStart = input.Position
+
+		if HoldTime then
+			PressId += 1
+			local Id = PressId
+
+			task.delay(HoldTime, function()
+				if Pending and PressId == Id then
+					Activate((DragInput or ActiveInput).Position)
+				end
+			end)
 		end
 	end)
 
-	Conn[4] = Listen(InputEndedListeners, function(input)
+	function OnEnd(input)
 		if input == ActiveInput then
 			Cancel()
 		end
-	end)
+	end
 
-	Conn[5] = Main.AncestryChanged:Connect(WatchScales)
+	Conn[2] = Main.AncestryChanged:Connect(WatchScales)
 
 	WatchScales()
 
-	function self:SetLocked(Value)
+	function Self:SetLocked(Value)
 		Locked = Value
 
 		if Value then
@@ -470,20 +511,20 @@ function UIGesture:MakeDraggable(Main, Handle, Fn, Config)
 		end
 	end
 
-	function self:Disconnect()
+	function Self:Disconnect()
 		DisconnectAll(Conn)
 		DisconnectAll(ScaleConn)
 		Cancel()
 	end
 
-	return Bind(self, Conn, Main, Handle)
+	return Bind(Self, Conn, Main, Handle)
 end
 
 function UIGesture:MakeResizeable(Main, Handle, MinSize, MaxSize, Fn, Config)
 	Main, Handle = Setup("Resizeable", Main, Handle)
 
-	MinSize = MinSize or Vector2.new(5, 5)
-	MaxSize = MaxSize or Vector2.new(math.huge, math.huge)
+	MinSize = MinSize or Vector2New(5, 5)
+	MaxSize = MaxSize or Vector2New(math.huge, math.huge)
 
 	Config = Config or {}
 
@@ -503,43 +544,14 @@ function UIGesture:MakeResizeable(Main, Handle, MinSize, MaxSize, Fn, Config)
 	local resizing = false
 	local Locked = false
 	local ActiveInput, DragInput, DragStart, StartSize, StartPos, StartAbsSize, StartAbsPos, AncestorScale, SizeScale, Ratio
+	local BoundLeft, BoundTop, BoundRight, BoundBottom
+
+	local OnEnd
 
 	local Conn = {}
-	local self = {}
+	local Self = {}
 
-	local function Cancel()
-		ActiveInput = nil
-		DragInput = nil
-
-		if resizing then
-			resizing = false
-			Call(Fn, false)
-		end
-	end
-
-	Conn[1] = Handle.InputBegan:Connect(function(input)
-		if resizing or Locked or not IsPress(input) then return end
-
-		resizing = true
-		ActiveInput = input
-		DragStart = input.Position
-		StartSize = Main.Size
-		StartPos = Main.Position
-		StartAbsSize = Main.AbsoluteSize
-		StartAbsPos = Main.AbsolutePosition
-		Ratio = if AspectRatio == true then (if StartAbsSize.X > 0 and StartAbsSize.Y > 0 then StartAbsSize.X / StartAbsSize.Y else 1) else AspectRatio
-
-		AncestorScale = GetAncestorScale(Main.Parent)
-
-		local OwnScale = Main:FindFirstChildOfClass("UIScale")
-		SizeScale = AncestorScale * (if OwnScale then OwnScale.Scale else 1)
-
-		Call(Fn, true)
-	end)
-
-	Conn[2] = Listen(FocusLostListeners, Cancel)
-
-	Conn[3] = Listen(InputChangedListeners, function(input)
+	local function OnMove(input)
 		if IsDragMovement(input, ActiveInput) then
 			DragInput = input
 		end
@@ -549,35 +561,17 @@ function UIGesture:MakeResizeable(Main, Handle, MinSize, MaxSize, Fn, Config)
 			local Min = if type(MinSize) == "function" then MinSize() else MinSize
 			local Max = if type(MaxSize) == "function" then MaxSize() else MaxSize
 
-			local BoundLeft, BoundTop, BoundRight, BoundBottom
-
-			if Bounds == "None" then
-				BoundLeft, BoundTop, BoundRight, BoundBottom = -math.huge, -math.huge, math.huge, math.huge
-			elseif typeof(Bounds) == "Instance" then
-				BoundLeft = Bounds.AbsolutePosition.X
-				BoundTop = Bounds.AbsolutePosition.Y
-				BoundRight = BoundLeft + Bounds.AbsoluteSize.X
-				BoundBottom = BoundTop + Bounds.AbsoluteSize.Y
-			elseif typeof(Bounds) == "Rect" then
-				BoundLeft = Bounds.Min.X
-				BoundTop = Bounds.Min.Y
-				BoundRight = Bounds.Max.X
-				BoundBottom = Bounds.Max.Y
-			else
-				BoundLeft, BoundTop, BoundRight, BoundBottom = GetScreenBounds()
-			end
-
-			local MaxWidth = math.min(if SignX < 0 then StartAbsPos.X + StartAbsSize.X - BoundLeft else BoundRight - StartAbsPos.X, Max.X)
-			local MaxHeight = math.min(if SignY < 0 then StartAbsPos.Y + StartAbsSize.Y - BoundTop else BoundBottom - StartAbsPos.Y, Max.Y)
+			local MaxWidth = MathMin(if SignX < 0 then StartAbsPos.X + StartAbsSize.X - BoundLeft else BoundRight - StartAbsPos.X, Max.X)
+			local MaxHeight = MathMin(if SignY < 0 then StartAbsPos.Y + StartAbsSize.Y - BoundTop else BoundBottom - StartAbsPos.Y, Max.Y)
 
 			local ClampedAbsWidth, ClampedAbsHeight
 
 			if Ratio then
 				local DesiredWidth = StartAbsSize.X + SignX * delta.X
 				local HeightAsWidth = (StartAbsSize.Y + SignY * delta.Y) * Ratio
-				local Width = if DriveX and DriveY then (if math.abs(DesiredWidth - StartAbsSize.X) >= math.abs(HeightAsWidth - StartAbsSize.X) then DesiredWidth else HeightAsWidth) elseif DriveX then DesiredWidth else HeightAsWidth
+				local Width = if DriveX and DriveY then (if MathAbs(DesiredWidth - StartAbsSize.X) >= MathAbs(HeightAsWidth - StartAbsSize.X) then DesiredWidth else HeightAsWidth) elseif DriveX then DesiredWidth else HeightAsWidth
 
-				ClampedAbsWidth = SafeClamp(Width, math.max(Min.X, Min.Y * Ratio), math.min(MaxWidth, MaxHeight * Ratio))
+				ClampedAbsWidth = SafeClamp(Width, MathMax(Min.X, Min.Y * Ratio), MathMin(MaxWidth, MaxHeight * Ratio))
 				ClampedAbsHeight = ClampedAbsWidth / Ratio
 			else
 				ClampedAbsWidth = if SignX == 0 then StartAbsSize.X else SafeClamp(StartAbsSize.X + SignX * delta.X, Min.X, MaxWidth)
@@ -587,7 +581,7 @@ function UIGesture:MakeResizeable(Main, Handle, MinSize, MaxSize, Fn, Config)
 			local AbsDeltaX = ClampedAbsWidth - StartAbsSize.X
 			local AbsDeltaY = ClampedAbsHeight - StartAbsSize.Y
 
-			Main.Size = UDim2.new(
+			Main.Size = UDim2New(
 				StartSize.X.Scale,
 				StartSize.X.Offset + AbsDeltaX / SizeScale,
 				StartSize.Y.Scale,
@@ -596,22 +590,75 @@ function UIGesture:MakeResizeable(Main, Handle, MinSize, MaxSize, Fn, Config)
 
 			local Anchor = Main.AnchorPoint
 
-			Main.Position = UDim2.new(
+			Main.Position = UDim2New(
 				StartPos.X.Scale,
-				StartPos.X.Offset + (Anchor.X + math.min(SignX, 0)) * AbsDeltaX / AncestorScale,
+				StartPos.X.Offset + (Anchor.X + MathMin(SignX, 0)) * AbsDeltaX / AncestorScale,
 				StartPos.Y.Scale,
-				StartPos.Y.Offset + (Anchor.Y + math.min(SignY, 0)) * AbsDeltaY / AncestorScale
+				StartPos.Y.Offset + (Anchor.Y + MathMin(SignY, 0)) * AbsDeltaY / AncestorScale
 			)
 		end
+	end
+
+	local function Cancel()
+		Detach(MoveHub, OnMove)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, Cancel)
+		ActiveInput = nil
+		DragInput = nil
+
+		if resizing then
+			resizing = false
+			if Fn then Fn(false) end
+		end
+	end
+
+	Conn[1] = Handle.InputBegan:Connect(function(input)
+		if resizing or Locked or not IsPress(input) then return end
+
+		resizing = true
+		ActiveInput = input
+		Attach(MoveHub, OnMove)
+		Attach(EndHub, OnEnd)
+		Attach(FocusHub, Cancel)
+		DragStart = input.Position
+		StartSize = Main.Size
+		StartPos = Main.Position
+		StartAbsSize = Main.AbsoluteSize
+		StartAbsPos = Main.AbsolutePosition
+
+		if Bounds == "None" then
+			BoundLeft, BoundTop, BoundRight, BoundBottom = -math.huge, -math.huge, math.huge, math.huge
+		elseif typeof(Bounds) == "Instance" then
+			BoundLeft = (Bounds :: GuiObject).AbsolutePosition.X
+			BoundTop = (Bounds :: GuiObject).AbsolutePosition.Y
+			BoundRight = BoundLeft + (Bounds :: GuiObject).AbsoluteSize.X
+			BoundBottom = BoundTop + (Bounds :: GuiObject).AbsoluteSize.Y
+		elseif typeof(Bounds) == "Rect" then
+			BoundLeft = Bounds.Min.X
+			BoundTop = Bounds.Min.Y
+			BoundRight = Bounds.Max.X
+			BoundBottom = Bounds.Max.Y
+		else
+			BoundLeft, BoundTop, BoundRight, BoundBottom = GetScreenBounds()
+		end
+
+		Ratio = if AspectRatio == true then (if StartAbsSize.X > 0 and StartAbsSize.Y > 0 then StartAbsSize.X / StartAbsSize.Y else 1) else AspectRatio
+
+		AncestorScale = GetAncestorScale(Main.Parent)
+
+		local OwnScale = Main:FindFirstChildOfClass("UIScale")
+		SizeScale = AncestorScale * (if OwnScale then OwnScale.Scale else 1)
+
+		if Fn then Fn(true) end
 	end)
 
-	Conn[4] = Listen(InputEndedListeners, function(input)
+	function OnEnd(input)
 		if input == ActiveInput then
 			Cancel()
 		end
-	end)
+	end
 
-	function self:SetLocked(Value)
+	function Self:SetLocked(Value)
 		Locked = Value
 
 		if Value then
@@ -619,12 +666,12 @@ function UIGesture:MakeResizeable(Main, Handle, MinSize, MaxSize, Fn, Config)
 		end
 	end
 
-	function self:Disconnect()
+	function Self:Disconnect()
 		DisconnectAll(Conn)
 		Cancel()
 	end
 
-	return Bind(self, Conn, Main, Handle)
+	return Bind(Self, Conn, Main, Handle)
 end
 
 function UIGesture:MakeSwipeable(Main, Handle, Callback, Threshold, MaxTime, Direction)
@@ -637,12 +684,16 @@ function UIGesture:MakeSwipeable(Main, Handle, Callback, Threshold, MaxTime, Dir
 	local Locked = false
 	local ActiveInput, StartPos, StartTime
 
+	local OnEnd
+
 	local Conn = {}
-	local self = {}
+	local Self = {}
 
 	local function Cancel()
 		swiping = false
 		ActiveInput = nil
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, Cancel)
 	end
 
 	Conn[1] = Handle.InputBegan:Connect(function(input)
@@ -650,23 +701,24 @@ function UIGesture:MakeSwipeable(Main, Handle, Callback, Threshold, MaxTime, Dir
 
 		swiping = true
 		ActiveInput = input
+		Attach(EndHub, OnEnd)
+		Attach(FocusHub, Cancel)
 		StartPos = input.Position
-		StartTime = os.clock()
+		StartTime = OsClock()
 	end)
 
-	Conn[2] = Listen(InputEndedListeners, function(input)
+	function OnEnd(input)
 		if input ~= ActiveInput then return end
 
-		swiping = false
-		ActiveInput = nil
+		Cancel()
 
-		local elapsed = os.clock() - StartTime
+		local elapsed = OsClock() - StartTime
 		if elapsed <= MaxTime then
 			local delta = input.Position - StartPos
 
 			if delta.Magnitude >= Threshold then
 				local direction
-				if math.abs(delta.X) > math.abs(delta.Y) then
+				if MathAbs(delta.X) > MathAbs(delta.Y) then
 					direction = delta.X > 0 and "Right" or "Left"
 				else
 					direction = delta.Y > 0 and "Down" or "Up"
@@ -688,25 +740,23 @@ function UIGesture:MakeSwipeable(Main, Handle, Callback, Threshold, MaxTime, Dir
 				end
 
 				if matches then
-					Call(Callback, direction, delta.Magnitude)
+					if Callback then Callback(direction, delta.Magnitude) end
 				end
 			end
 		end
-	end)
+	end
 
-	Conn[3] = Listen(FocusLostListeners, Cancel)
-
-	function self:SetLocked(Value)
+	function Self:SetLocked(Value)
 		Locked = Value
 		Cancel()
 	end
 
-	function self:Disconnect()
+	function Self:Disconnect()
 		DisconnectAll(Conn)
 		Cancel()
 	end
 
-	return Bind(self, Conn, Main, Handle)
+	return Bind(Self, Conn, Main, Handle)
 end
 
 function UIGesture:MakeRotatable(Main, Handle, Fn, Config)
@@ -722,39 +772,18 @@ function UIGesture:MakeRotatable(Main, Handle, Fn, Config)
 	local Locked = false
 	local ActiveInput, DragInput, LastAngle, TotalRotation
 
+	local OnEnd
+
 	local Conn = {}
-	local self = {}
+	local Self = {}
 
 	local function GetAngle(inputPosition)
 		local center = Main.AbsolutePosition + Main.AbsoluteSize / 2
-		local delta = Vector2.new(inputPosition.X, inputPosition.Y) - center
-		return math.deg(math.atan2(delta.Y, delta.X))
+		local delta = Vector2New(inputPosition.X, inputPosition.Y) - center
+		return MathDeg(MathAtan2(delta.Y, delta.X))
 	end
 
-	local function Cancel()
-		ActiveInput = nil
-		DragInput = nil
-
-		if rotating then
-			rotating = false
-			Call(Fn, false)
-		end
-	end
-
-	Conn[1] = Handle.InputBegan:Connect(function(input)
-		if rotating or Locked or not IsPress(input) then return end
-
-		rotating = true
-		ActiveInput = input
-		LastAngle = GetAngle(input.Position)
-		TotalRotation = Main.Rotation
-
-		Call(Fn, true)
-	end)
-
-	Conn[2] = Listen(FocusLostListeners, Cancel)
-
-	Conn[3] = Listen(InputChangedListeners, function(input)
+	local function OnMove(input)
 		if IsDragMovement(input, ActiveInput) then
 			DragInput = input
 		end
@@ -765,17 +794,44 @@ function UIGesture:MakeRotatable(Main, Handle, Fn, Config)
 			TotalRotation = SafeClamp(TotalRotation + (CurrentAngle - LastAngle + 180) % 360 - 180, MinAngle, MaxAngle)
 			LastAngle = CurrentAngle
 
-			Main.Rotation = SafeClamp(if Step then math.round(TotalRotation / Step) * Step else TotalRotation, MinAngle, MaxAngle)
+			Main.Rotation = SafeClamp(if Step then MathRound(TotalRotation / Step) * Step else TotalRotation, MinAngle, MaxAngle)
 		end
+	end
+
+	local function Cancel()
+		Detach(MoveHub, OnMove)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, Cancel)
+		ActiveInput = nil
+		DragInput = nil
+
+		if rotating then
+			rotating = false
+			if Fn then Fn(false) end
+		end
+	end
+
+	Conn[1] = Handle.InputBegan:Connect(function(input)
+		if rotating or Locked or not IsPress(input) then return end
+
+		rotating = true
+		ActiveInput = input
+		Attach(MoveHub, OnMove)
+		Attach(EndHub, OnEnd)
+		Attach(FocusHub, Cancel)
+		LastAngle = GetAngle(input.Position)
+		TotalRotation = Main.Rotation
+
+		if Fn then Fn(true) end
 	end)
 
-	Conn[4] = Listen(InputEndedListeners, function(input)
+	function OnEnd(input)
 		if input == ActiveInput then
 			Cancel()
 		end
-	end)
+	end
 
-	function self:SetLocked(Value)
+	function Self:SetLocked(Value)
 		Locked = Value
 
 		if Value then
@@ -783,12 +839,12 @@ function UIGesture:MakeRotatable(Main, Handle, Fn, Config)
 		end
 	end
 
-	function self:Disconnect()
+	function Self:Disconnect()
 		DisconnectAll(Conn)
 		Cancel()
 	end
 
-	return Bind(self, Conn, Main, Handle)
+	return Bind(Self, Conn, Main, Handle)
 end
 
 function UIGesture:MakeZoomable(Main, Handle, MinZoom, MaxZoom, ZoomStep, Fn, Config)
@@ -824,7 +880,7 @@ function UIGesture:MakeZoomable(Main, Handle, MinZoom, MaxZoom, ZoomStep, Fn, Co
 			return 1
 		end
 
-		return math.min(
+		return MathMin(
 			Handle.AbsoluteSize.X / baseContentSize.X,
 			Handle.AbsoluteSize.Y / baseContentSize.Y
 		)
@@ -833,24 +889,31 @@ function UIGesture:MakeZoomable(Main, Handle, MinZoom, MaxZoom, ZoomStep, Fn, Co
 	local InitialScale = ContentScale.Scale
 	local InitialPosition = Main.Position
 	local ZoomConn
+	local CachedFit, CachedParentScale, CachedCenter
 
 	local pinching = false
 	local Locked = false
 	local Touches = {}
 	local StartDistance, StartScale, StartAbsSize, StartPos, StartAbsPos, StartMid
 
+	local OnEnd, OnFocus
+
 	local Conn = {}
-	local self = {}
+	local Self = {}
 
 	local function GetMid()
 		local Mid = (Touches[1].Position + Touches[2].Position) / 2
-		return Vector2.new(Mid.X, Mid.Y)
+		return Vector2New(Mid.X, Mid.Y)
+	end
+
+	local function Refresh()
+		CachedFit = GetFitScale()
+		CachedParentScale = GetAncestorScale(Main.Parent)
+		CachedCenter = Handle.AbsolutePosition + Handle.AbsoluteSize / 2
 	end
 
 	local function ClampScale(Value)
-		local FitScale = GetFitScale()
-
-		return SafeClamp(Value, FitScale / (if MaxZoom > 0 then MaxZoom else 1), FitScale / (if MinZoom > 0 then MinZoom else 1))
+		return SafeClamp(Value, CachedFit / (if MaxZoom > 0 then MaxZoom else 1), CachedFit / (if MinZoom > 0 then MinZoom else 1))
 	end
 
 	local function ApplyZoom(TargetScale, baseScale, baseAbsSize, basePos, baseAbsPos, FromPoint, ToPoint)
@@ -861,9 +924,8 @@ function UIGesture:MakeZoomable(Main, Handle, MinZoom, MaxZoom, ZoomStep, Fn, Co
 			return
 		end
 
-		local anchorScreen = Handle.AbsolutePosition + Handle.AbsoluteSize / 2
-		FromPoint = FromPoint or anchorScreen
-		ToPoint = ToPoint or anchorScreen
+		FromPoint = FromPoint or CachedCenter
+		ToPoint = ToPoint or CachedCenter
 		local newAbsSize = baseAbsSize * (clampedScale / baseScale)
 
 		local fractionX = (FromPoint.X - baseAbsPos.X) / baseAbsSize.X
@@ -874,13 +936,12 @@ function UIGesture:MakeZoomable(Main, Handle, MinZoom, MaxZoom, ZoomStep, Fn, Co
 
 		local anchor = Main.AnchorPoint
 		local sizeDelta = newAbsSize - baseAbsSize
-		local AncestorScale = GetAncestorScale(Main.Parent)
 
-		Main.Position = UDim2.new(
+		Main.Position = UDim2New(
 			basePos.X.Scale,
-			basePos.X.Offset + (desiredAbsX - baseAbsPos.X + anchor.X * sizeDelta.X) / AncestorScale,
+			basePos.X.Offset + (desiredAbsX - baseAbsPos.X + anchor.X * sizeDelta.X) / CachedParentScale,
 			basePos.Y.Scale,
-			basePos.Y.Offset + (desiredAbsY - baseAbsPos.Y + anchor.Y * sizeDelta.Y) / AncestorScale
+			basePos.Y.Offset + (desiredAbsY - baseAbsPos.Y + anchor.Y * sizeDelta.Y) / CachedParentScale
 		)
 
 		ContentScale.Scale = clampedScale
@@ -901,10 +962,10 @@ function UIGesture:MakeZoomable(Main, Handle, MinZoom, MaxZoom, ZoomStep, Fn, Co
 			return
 		end
 
-		local StartTime = os.clock()
+		local StartTime = OsClock()
 
-		ZoomConn = RunService.Heartbeat:Connect(function()
-			local Alpha = math.min((os.clock() - StartTime) / Duration, 1)
+		ZoomConn = RunService.PreRender:Connect(function()
+			local Alpha = MathMin((OsClock() - StartTime) / Duration, 1)
 
 			Step(1 - (1 - Alpha) ^ 2)
 
@@ -915,6 +976,8 @@ function UIGesture:MakeZoomable(Main, Handle, MinZoom, MaxZoom, ZoomStep, Fn, Co
 	end
 
 	local function ZoomToScale(TargetScale, Pivot, Duration)
+		Refresh()
+
 		local BaseScale = ContentScale.Scale
 		local BaseAbsSize = Main.AbsoluteSize
 		local BasePos = Main.Position
@@ -926,106 +989,117 @@ function UIGesture:MakeZoomable(Main, Handle, MinZoom, MaxZoom, ZoomStep, Fn, Co
 		end)
 	end
 
-	local function Cancel()
-		if pinching then
-			pinching = false
-			Call(Fn, false)
-		end
-	end
-
-	Conn[1] = Handle.InputBegan:Connect(function(input)
-		if Locked or not Pinch or not AddTouch(Touches, input) then return end
-
-		StopZoomAnimation()
-
-		pinching = true
-		StartDistance = (Touches[1].Position - Touches[2].Position).Magnitude
-		StartScale = ContentScale.Scale
-		StartAbsSize = Main.AbsoluteSize
-		StartPos = Main.Position
-		StartAbsPos = Main.AbsolutePosition
-		StartMid = if ZoomToPointer then GetMid() else nil
-
-		Call(Fn, true)
-	end)
-
-	Conn[2] = Listen(InputEndedListeners, function(input)
-		if not RemoveTouch(Touches, input) or not pinching then return end
-
-		pinching = false
-
-		Call(Fn, false)
-	end)
-
-	Conn[3] = Listen(InputChangedListeners, function(input)
+	local function OnMove(input)
 		if not pinching or (input ~= Touches[1] and input ~= Touches[2]) then return end
 
 		local currentDistance = (Touches[1].Position - Touches[2].Position).Magnitude
-		local factor = currentDistance / math.max(StartDistance, 1)
+		local factor = currentDistance / MathMax(StartDistance, 1)
 
 		ApplyZoom(StartScale * factor, StartScale, StartAbsSize, StartPos, StartAbsPos, StartMid, StartMid and GetMid())
-	end)
+	end
 
-	Conn[4] = Handle.InputChanged:Connect(function(input)
-		if Locked or not Wheel or input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
+	local function Cancel()
+		if pinching then
+			pinching = false
+			Detach(MoveHub, OnMove)
+			if Fn then Fn(false) end
+		end
+	end
 
-		StopZoomAnimation()
+	if Pinch then
+		TableInsert(Conn, Handle.InputBegan:Connect(function(input)
+			if Locked or not AddTouch(Touches, input, OnEnd, OnFocus) then return end
 
-		local direction = input.Position.Z
-		local factor = 1 + (direction * ZoomStep)
+			StopZoomAnimation()
+			Refresh()
 
-		local Pointer = if ZoomToPointer then UserInputService:GetMouseLocation() - GuiService:GetGuiInset() else nil
+			pinching = true
+			Attach(MoveHub, OnMove)
+			StartDistance = (Touches[1].Position - Touches[2].Position).Magnitude
+			StartScale = ContentScale.Scale
+			StartAbsSize = Main.AbsoluteSize
+			StartPos = Main.Position
+			StartAbsPos = Main.AbsolutePosition
+			StartMid = if ZoomToPointer then GetMid() else nil
 
-		ApplyZoom(ContentScale.Scale * factor, ContentScale.Scale, Main.AbsoluteSize, Main.Position, Main.AbsolutePosition, Pointer, Pointer)
-	end)
+			if Fn then Fn(true) end
+		end))
+	end
 
-	Conn[5] = Listen(FocusLostListeners, function()
-		table.clear(Touches)
+	function OnEnd(input)
+		if not RemoveTouch(Touches, input, OnEnd, OnFocus) or not pinching then return end
+
+		pinching = false
+		Detach(MoveHub, OnMove)
+
+		if Fn then Fn(false) end
+	end
+
+	if Wheel then
+		TableInsert(Conn, Handle.InputChanged:Connect(function(input)
+			if Locked or input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
+
+			StopZoomAnimation()
+			Refresh()
+
+			local direction = input.Position.Z
+			local factor = 1 + (direction * ZoomStep)
+
+			local Pointer = if ZoomToPointer then UserInputService:GetMouseLocation() - GuiService:GetGuiInset() else nil
+
+			ApplyZoom(ContentScale.Scale * factor, ContentScale.Scale, Main.AbsoluteSize, Main.Position, Main.AbsolutePosition, Pointer, Pointer)
+		end))
+	end
+
+	function OnFocus()
+		TableClear(Touches)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, OnFocus)
 		Cancel()
-	end)
+	end
 
-	function self:SetLocked(Value)
+	function Self:SetLocked(Value)
 		Locked = Value
 		Cancel()
 	end
 
 	local ScaleListeners = {}
 
-	table.insert(Conn, ContentScale:GetPropertyChangedSignal("Scale"):Connect(function()
-		Dispatch(ScaleListeners, self:GetScale())
+	TableInsert(Conn, ContentScale:GetPropertyChangedSignal("Scale"):Connect(function()
+		if next(ScaleListeners) then Dispatch(ScaleListeners, Self:GetScale()) end
 	end))
 
-	function self:OnScaleChanged(Callback)
+	function Self:OnScaleChanged(Callback)
 		return Listen(ScaleListeners, Callback)
 	end
 
-	function self:ZoomTo(Zoom, Pivot, Duration)
+	function Self:ZoomTo(Zoom, Pivot, Duration)
 		ZoomToScale(GetFitScale() / Zoom, Pivot, Duration)
 	end
 
-	function self:ZoomIn(Pivot, Duration)
+	function Self:ZoomIn(Pivot, Duration)
 		ZoomToScale(ContentScale.Scale * (1 + ZoomStep), Pivot, Duration)
 	end
 
-	function self:ZoomOut(Pivot, Duration)
+	function Self:ZoomOut(Pivot, Duration)
 		ZoomToScale(ContentScale.Scale * (1 - ZoomStep), Pivot, Duration)
 	end
 
-	function self:Fit(Duration)
+	function Self:Fit(Duration)
+		Refresh()
+
 		local BaseScale = ContentScale.Scale
 		local BaseAbsSize = Main.AbsoluteSize
 		local BasePos = Main.Position
 		local BaseAbsPos = Main.AbsolutePosition
 		local FromPoint = BaseAbsPos + BaseAbsSize / 2
-		local ToPoint = Handle.AbsolutePosition + Handle.AbsoluteSize / 2
-		local FitScale = GetFitScale()
 
 		RunAnimation(Duration, function(Eased)
-			ApplyZoom(BaseScale + (FitScale - BaseScale) * Eased, BaseScale, BaseAbsSize, BasePos, BaseAbsPos, FromPoint, FromPoint:Lerp(ToPoint, Eased))
+			ApplyZoom(BaseScale + (CachedFit - BaseScale) * Eased, BaseScale, BaseAbsSize, BasePos, BaseAbsPos, FromPoint, FromPoint:Lerp(CachedCenter, Eased))
 		end)
 	end
 
-	function self:Reset(Duration)
+	function Self:Reset(Duration)
 		local BaseScale = ContentScale.Scale
 		local BasePos = Main.Position
 
@@ -1035,22 +1109,24 @@ function UIGesture:MakeZoomable(Main, Handle, MinZoom, MaxZoom, ZoomStep, Fn, Co
 		end)
 	end
 
-	function self:GetScale()
+	function Self:GetScale()
 		return GetFitScale() / ContentScale.Scale
 	end
 
-	function self:GetRange()
+	function Self:GetRange()
 		return (if MinZoom > 0 then MinZoom else 1), (if MaxZoom > 0 then MaxZoom else 1)
 	end
 
-	function self:Disconnect()
+	function Self:Disconnect()
 		DisconnectAll(Conn)
 		StopZoomAnimation()
-		table.clear(Touches)
+		TableClear(Touches)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, OnFocus)
 		Cancel()
 	end
 
-	return Bind(self, Conn, Main, Handle)
+	return Bind(Self, Conn, Main, Handle)
 end
 
 function UIGesture:MakePannable(Main, Handle, Fn, Config)
@@ -1089,16 +1165,19 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 	local Interrupted = false
 	local ActiveInput, DragInput, DragStart
 	local BasePos = Main.Position
-	local CurrentOffset, DragStartOffset = Vector2.new(0, 0), Vector2.new(0, 0)
-	local LastOffset, LastSampleTime, Velocity = Vector2.new(0, 0), 0, Vector2.new(0, 0)
+	local CurrentOffset, DragStartOffset = Vector2.zero, Vector2.zero
+	local LastOffset, LastSampleTime, Velocity = Vector2.zero, 0, Vector2.zero
 	local MomentumConn
+	local PanScale
+
+	local OnEnd, Release
 
 	local Conn = {}
-	local self = {}
+	local Self = {}
 
 	local function ApplyPan(offset, Silent)
 		if MoveMain then
-			Main.Position = UDim2.new(
+			Main.Position = UDim2New(
 				BasePos.X.Scale,
 				BasePos.X.Offset + offset.X,
 				BasePos.Y.Scale,
@@ -1107,7 +1186,7 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 		end
 
 		if not Silent then
-			Call(Fn, offset, offset.Magnitude, panning)
+			if Fn then Fn(offset, offset.Magnitude, panning) end
 		end
 	end
 
@@ -1116,11 +1195,9 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 	end
 
 	local function ClampOffset(offset)
-		local scale = GetScale()
-
 		if LockAxis == "X" or LockAxis == "Y" then
 			local value = if LockAxis == "X" then offset.X else offset.Y
-			local handleSize = (if LockAxis == "X" then Handle.AbsoluteSize.X else Handle.AbsoluteSize.Y) / scale
+			local handleSize = (if LockAxis == "X" then Handle.AbsoluteSize.X else Handle.AbsoluteSize.Y) / PanScale
 			local min, max = -math.huge, math.huge
 
 			if type(Radius) == "table" then
@@ -1131,7 +1208,7 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 				end
 			elseif Radius then
 				if Normalization then
-					local effective = math.max((Radius - handleSize) / 2, 0)
+					local effective = MathMax((Radius - handleSize) / 2, 0)
 					min, max = -effective, effective
 				else
 					min, max = -Radius, Radius
@@ -1140,29 +1217,29 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 
 			value = SafeClamp(value, min, max)
 
-			return if LockAxis == "X" then Vector2.new(value, 0) else Vector2.new(0, value)
+			return if LockAxis == "X" then Vector2New(value, 0) else Vector2New(0, value)
 		end
 
 		if typeof(Radius) == "Vector2" then
 			if Normalization then
-				local effectiveX = math.max((Radius.X - Handle.AbsoluteSize.X / scale) / 2, 0)
-				local effectiveY = math.max((Radius.Y - Handle.AbsoluteSize.Y / scale) / 2, 0)
+				local effectiveX = MathMax((Radius.X - Handle.AbsoluteSize.X / PanScale) / 2, 0)
+				local effectiveY = MathMax((Radius.Y - Handle.AbsoluteSize.Y / PanScale) / 2, 0)
 
-				return Vector2.new(
-					math.clamp(offset.X, -effectiveX, effectiveX),
-					math.clamp(offset.Y, -effectiveY, effectiveY)
+				return Vector2New(
+					MathClamp(offset.X, -effectiveX, effectiveX),
+					MathClamp(offset.Y, -effectiveY, effectiveY)
 				)
 			end
 
-			return Vector2.new(
-				math.clamp(offset.X, -Radius.X, Radius.X),
-				math.clamp(offset.Y, -Radius.Y, Radius.Y)
+			return Vector2New(
+				MathClamp(offset.X, -Radius.X, Radius.X),
+				MathClamp(offset.Y, -Radius.Y, Radius.Y)
 			)
 		end
 
 		if Radius then
 			if Normalization then
-				local effectiveRadius = math.max((Radius - Handle.AbsoluteSize.X / scale) / 2, 0)
+				local effectiveRadius = MathMax((Radius - Handle.AbsoluteSize.X / PanScale) / 2, 0)
 				if offset.Magnitude > effectiveRadius then
 					offset = offset.Unit * effectiveRadius
 				end
@@ -1188,14 +1265,14 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 			CurrentOffset = Target
 			ApplyPan(Target)
 
-			Call(Fn, Target, Target.Magnitude, false, true)
+			if Fn then Fn(Target, Target.Magnitude, false, true) end
 			return
 		end
 
 		local offset = CurrentOffset
 
-		MomentumConn = RunService.Heartbeat:Connect(function(dt)
-			offset = Target + (offset - Target) * math.exp(-Speed * dt)
+		MomentumConn = RunService.PreRender:Connect(function(dt)
+			offset = Target + (offset - Target) * MathExp(-Speed * dt)
 
 			local Done = (offset - Target).Magnitude < 0.5
 			if Done then
@@ -1207,34 +1284,34 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 			ApplyPan(offset)
 
 			if Done and not Programmatic then
-				Call(Fn, offset, offset.Magnitude, false, true)
+				if Fn then Fn(offset, offset.Magnitude, false, true) end
 			end
 		end)
 	end
 
 	local function Settle()
 		if ReturnToCenter then
-			Glide(Vector2.new(0, 0), ReturnSpeed, false)
+			Glide(Vector2.zero, ReturnSpeed, false)
 		else
-			Call(Fn, CurrentOffset, CurrentOffset.Magnitude, false, true)
+			if Fn then Fn(CurrentOffset, CurrentOffset.Magnitude, false, true) end
 		end
 	end
 
 	local function Begin(Position)
+		PanScale = GetScale()
 		panning = true
 		Interrupted = false
 		DragStart = Position
 		DragStartOffset = CurrentOffset
 		LastOffset = CurrentOffset
-		LastSampleTime = os.clock()
-		Velocity = Vector2.new(0, 0)
+		LastSampleTime = OsClock()
+		Velocity = Vector2.zero
 
-		Call(Fn, CurrentOffset, CurrentOffset.Magnitude, true)
+		if Fn then Fn(CurrentOffset, CurrentOffset.Magnitude, true) end
 
 		if ClickToJump then
-			local Scale = GetScale()
-			local ZeroAbsolutePos = if MoveMain then Main.AbsolutePosition - CurrentOffset * Scale else Main.AbsolutePosition
-			local JumpOffset = ClampOffset((Vector2.new(Position.X, Position.Y) - ZeroAbsolutePos) / Scale)
+			local ZeroAbsolutePos = if MoveMain then Main.AbsolutePosition - CurrentOffset * PanScale else Main.AbsolutePosition
+			local JumpOffset = ClampOffset((Vector2New(Position.X, Position.Y) - ZeroAbsolutePos) / PanScale)
 
 			DragStartOffset = JumpOffset
 			LastOffset = JumpOffset
@@ -1244,6 +1321,8 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 	end
 
 	local function Finish()
+		PanScale = GetScale()
+
 		local Bound = ClampOffset(CurrentOffset)
 
 		if Snap then
@@ -1252,24 +1331,24 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 
 			if type(Snap) == "table" then
 				for _, Point in Snap do
-					if not Target or math.abs(Point - Landing) < math.abs(Target - Landing) then
+					if not Target or MathAbs(Point - Landing) < MathAbs(Target - Landing) then
 						Target = Point
 					end
 				end
 			else
-				Target = math.round(Landing / Snap) * Snap
+				Target = MathRound(Landing / Snap) * Snap
 			end
 
-			Glide(ClampOffset(if LockAxis == "X" then Vector2.new(Target, 0) else Vector2.new(0, Target)), ReturnSpeed or 12, false)
+			Glide(ClampOffset(if LockAxis == "X" then Vector2New(Target, 0) else Vector2New(0, Target)), ReturnSpeed or 12, false)
 		elseif Overscroll and Bound ~= CurrentOffset then
-			Glide(if ReturnToCenter then Vector2.new(0, 0) else Bound, ReturnSpeed or 12, false)
+			Glide(if ReturnToCenter then Vector2.zero else Bound, ReturnSpeed or 12, false)
 		elseif Momentum then
 			StopMomentum()
 
 			local velocity = Velocity
 			local offset = CurrentOffset
 
-			MomentumConn = RunService.Heartbeat:Connect(function(dt)
+			MomentumConn = RunService.PreRender:Connect(function(dt)
 				local Limit = ClampOffset(offset)
 				local Excess = offset - Limit
 
@@ -1293,7 +1372,7 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 						offset = Limit + Excess.Unit * Overscroll
 					end
 				else
-					velocity = velocity * math.exp(-Friction * dt)
+					velocity = velocity * MathExp(-Friction * dt)
 
 					if velocity.Magnitude < 1 then
 						StopMomentum()
@@ -1315,12 +1394,67 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 	local function Resume()
 		if Interrupted then
 			Interrupted = false
-			Velocity = Vector2.new(0, 0)
+			Velocity = Vector2.zero
 			Finish()
 		end
 	end
 
-	local function Release()
+	local function OnMove(input)
+		if IsDragMovement(input, ActiveInput) then
+			DragInput = input
+		end
+
+		if Pending and input == DragInput then
+			local Delta = input.Position - DragStart
+
+			if Delta.Magnitude >= Threshold then
+				Pending = false
+
+				if ActivationAxis and MathAbs(if ActivationAxis == "X" then Delta.Y else Delta.X) > MathAbs(if ActivationAxis == "X" then Delta.X else Delta.Y) then
+					Detach(MoveHub, OnMove)
+					Detach(EndHub, OnEnd)
+					Detach(FocusHub, Release)
+					ActiveInput = nil
+					DragInput = nil
+					Resume()
+				else
+					Begin(input.Position)
+				end
+			end
+
+			return
+		end
+
+		if panning and input == DragInput then
+			local delta = input.Position - DragStart
+			local raw = DragStartOffset + Vector2New(delta.X, delta.Y) / PanScale
+			local offset = ClampOffset(raw)
+
+			if Overscroll then
+				local Excess = raw - offset
+				if Excess.Magnitude > 0 then
+					offset = offset + Excess.Unit * (Excess.Magnitude * Overscroll / (Excess.Magnitude + Overscroll))
+				end
+			end
+
+			local now = OsClock()
+			local dt = now - LastSampleTime
+			if dt > 0 then
+				Velocity = (offset - LastOffset) / dt
+			end
+			LastOffset = offset
+			LastSampleTime = now
+			CurrentOffset = offset
+
+			ApplyPan(offset)
+		end
+	end
+
+	function Release()
+		Detach(MoveHub, OnMove)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, Release)
+
 		if Pending then
 			Pending = false
 
@@ -1338,10 +1472,10 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 		ActiveInput = nil
 		DragInput = nil
 
-		Call(Fn, CurrentOffset, CurrentOffset.Magnitude, false)
+		if Fn then Fn(CurrentOffset, CurrentOffset.Magnitude, false) end
 
-		if os.clock() - LastSampleTime > 0.1 then
-			Velocity = Vector2.new(0, 0)
+		if OsClock() - LastSampleTime > 0.1 then
+			Velocity = Vector2.zero
 		end
 
 		Finish()
@@ -1354,6 +1488,9 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 		StopMomentum()
 
 		ActiveInput = input
+		Attach(MoveHub, OnMove)
+		Attach(EndHub, OnEnd)
+		Attach(FocusHub, Release)
 		DragStart = input.Position
 
 		if Threshold == 0 and not ActivationAxis then
@@ -1363,68 +1500,14 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 		end
 	end)
 
-	Conn[2] = Listen(FocusLostListeners, function()
-		if ActiveInput then
-			Release()
-		end
-	end)
-
-	Conn[3] = Listen(InputChangedListeners, function(input)
-		if IsDragMovement(input, ActiveInput) then
-			DragInput = input
-		end
-
-		if Pending and input == DragInput then
-			local Delta = input.Position - DragStart
-
-			if Delta.Magnitude >= Threshold then
-				Pending = false
-
-				if ActivationAxis and math.abs(if ActivationAxis == "X" then Delta.Y else Delta.X) > math.abs(if ActivationAxis == "X" then Delta.X else Delta.Y) then
-					ActiveInput = nil
-					DragInput = nil
-					Resume()
-				else
-					Begin(input.Position)
-				end
-			end
-
-			return
-		end
-
-		if panning and input == DragInput then
-			local delta = input.Position - DragStart
-			local raw = DragStartOffset + Vector2.new(delta.X, delta.Y) / GetScale()
-			local offset = ClampOffset(raw)
-
-			if Overscroll then
-				local Excess = raw - offset
-				if Excess.Magnitude > 0 then
-					offset = offset + Excess.Unit * (Excess.Magnitude * Overscroll / (Excess.Magnitude + Overscroll))
-				end
-			end
-
-			local now = os.clock()
-			local dt = now - LastSampleTime
-			if dt > 0 then
-				Velocity = (offset - LastOffset) / dt
-			end
-			LastOffset = offset
-			LastSampleTime = now
-			CurrentOffset = offset
-
-			ApplyPan(offset)
-		end
-	end)
-
-	Conn[4] = Listen(InputEndedListeners, function(input)
+	function OnEnd(input)
 		if input == ActiveInput then
 			Release()
 		end
-	end)
+	end
 
-	Conn[5] = Main:GetPropertyChangedSignal("Position"):Connect(function()
-		BasePos = UDim2.new(
+	Conn[2] = Main:GetPropertyChangedSignal("Position"):Connect(function()
+		BasePos = UDim2New(
 			Main.Position.X.Scale,
 			Main.Position.X.Offset - CurrentOffset.X,
 			Main.Position.Y.Scale,
@@ -1432,7 +1515,9 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 		)
 	end)
 
-	function self:SetOffset(Offset, Animate)
+	function Self:SetOffset(Offset, Animate)
+		PanScale = GetScale()
+
 		local Target = ClampOffset(Offset)
 
 		if Animate then
@@ -1443,7 +1528,7 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 		StopMomentum()
 		CurrentOffset = Target
 		LastOffset = Target
-		Velocity = Vector2.new(0, 0)
+		Velocity = Vector2.zero
 
 		if panning then
 			DragStart = (DragInput or ActiveInput).Position
@@ -1453,46 +1538,49 @@ function UIGesture:MakePannable(Main, Handle, Fn, Config)
 		ApplyPan(Target, true)
 	end
 
-	function self:GetOffset()
+	function Self:GetOffset()
 		return CurrentOffset
 	end
 
-	function self:SetSnap(Value)
+	function Self:SetSnap(Value)
 		assert(not (Value and not LockAxis), "MakePannable: Snap requires LockAxis to be set")
 		AssertSnap(Value)
 
 		Snap = Value
 	end
 
-	function self:SetRadius(Value)
+	function Self:SetRadius(Value)
 		assert(not (type(Value) == "table" and not LockAxis), "MakePannable: Radius table (Min/Max) requires LockAxis to be set")
 
 		Radius = Value
-		self:SetOffset(CurrentOffset)
+		Self:SetOffset(CurrentOffset)
 	end
 
-	function self:SetLocked(Value)
+	function Self:SetLocked(Value)
 		Locked = Value
 
 		if not Value then return end
 
 		StopMomentum()
+		Detach(MoveHub, OnMove)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, Release)
 		Pending = false
 		ActiveInput = nil
 		DragInput = nil
 
 		if panning then
 			panning = false
-			Call(Fn, CurrentOffset, CurrentOffset.Magnitude, false)
+			if Fn then Fn(CurrentOffset, CurrentOffset.Magnitude, false) end
 		end
 	end
 
-	function self:Disconnect()
+	function Self:Disconnect()
 		DisconnectAll(Conn)
-		self:SetLocked(true)
+		Self:SetLocked(true)
 	end
 
-	return Bind(self, Conn, Main, Handle)
+	return Bind(Self, Conn, Main, Handle)
 end
 
 function UIGesture:MakeHoverable(Main, Handle, Callback)
@@ -1503,8 +1591,10 @@ function UIGesture:MakeHoverable(Main, Handle, Callback)
 	local Inside = false
 	local Locked = false
 
+	local OnFocus
+
 	local Conn = {}
-	local self = {}
+	local Self = {}
 
 	local function Leave()
 		if not hovering then return end
@@ -1515,6 +1605,7 @@ function UIGesture:MakeHoverable(Main, Handle, Callback)
 
 	Conn[1] = Handle.MouseEnter:Connect(function()
 		Inside = true
+		Attach(FocusHub, OnFocus)
 
 		if Locked then return end
 
@@ -1525,14 +1616,16 @@ function UIGesture:MakeHoverable(Main, Handle, Callback)
 	Conn[2] = Handle.MouseLeave:Connect(function()
 		Inside = false
 		Leave()
+		Detach(FocusHub, OnFocus)
 	end)
 
-	Conn[3] = Listen(FocusLostListeners, function()
+	function OnFocus()
 		Inside = false
 		Leave()
-	end)
+		Detach(FocusHub, OnFocus)
+	end
 
-	function self:SetLocked(Value)
+	function Self:SetLocked(Value)
 		Locked = Value
 
 		if Value then
@@ -1543,12 +1636,13 @@ function UIGesture:MakeHoverable(Main, Handle, Callback)
 		end
 	end
 
-	function self:Disconnect()
+	function Self:Disconnect()
 		DisconnectAll(Conn)
 		Leave()
+		Detach(FocusHub, OnFocus)
 	end
 
-	return Bind(self, Conn, Main, Handle)
+	return Bind(Self, Conn, Main, Handle)
 end
 
 function UIGesture:MakeLongPressable(Main, Handle, Callback, Config)
@@ -1569,15 +1663,46 @@ function UIGesture:MakeLongPressable(Main, Handle, Callback, Config)
 	local PressId = 0
 	local ActiveInput, DragInput, StartPos
 
+	local OnEnd, Cancel
+
 	local Conn = {}
-	local self = {}
+	local Self = {}
 
 	local function GetPosition(input)
-		return Vector2.new(input.Position.X, input.Position.Y)
+		return Vector2New(input.Position.X, input.Position.Y)
 	end
 
-	local function Cancel()
+	local function OnMove(input)
+		if IsDragMovement(input, ActiveInput) then
+			DragInput = input
+		end
+
+		if not pressing or input ~= DragInput then return end
+
+		local Distance = (input.Position - StartPos).Magnitude
+
+		if Count > 0 then
+			if RepeatTolerance and Distance > RepeatTolerance then
+				pressing = false
+			end
+		elseif Distance > MoveTolerance then
+			pressing = false
+			ActiveInput = nil
+			DragInput = nil
+			Detach(MoveHub, OnMove)
+			Detach(EndHub, OnEnd)
+			Detach(FocusHub, Cancel)
+
+			Callback(0, GetPosition(input), false, true, false)
+		end
+	end
+
+	function Cancel()
 		if not ActiveInput then return end
+
+		Detach(MoveHub, OnMove)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, Cancel)
 
 		local Position = GetPosition(DragInput or ActiveInput)
 		local Held = Count > 0
@@ -1595,6 +1720,9 @@ function UIGesture:MakeLongPressable(Main, Handle, Callback, Config)
 		pressing = true
 		Count = 0
 		ActiveInput = input
+		Attach(MoveHub, OnMove)
+		Attach(EndHub, OnEnd)
+		Attach(FocusHub, Cancel)
 		StartPos = input.Position
 		PressId += 1
 
@@ -1619,41 +1747,20 @@ function UIGesture:MakeLongPressable(Main, Handle, Callback, Config)
 		end)
 	end)
 
-	Conn[2] = Listen(FocusLostListeners, Cancel)
-
-	Conn[3] = Listen(InputChangedListeners, function(input)
-		if IsDragMovement(input, ActiveInput) then
-			DragInput = input
-		end
-
-		if not pressing or input ~= DragInput then return end
-
-		local Distance = (input.Position - StartPos).Magnitude
-
-		if Count > 0 then
-			if RepeatTolerance and Distance > RepeatTolerance then
-				pressing = false
-			end
-		elseif Distance > MoveTolerance then
-			pressing = false
-			ActiveInput = nil
-			DragInput = nil
-
-			Callback(0, GetPosition(input), false, true, false)
-		end
-	end)
-
-	Conn[4] = Listen(InputEndedListeners, function(input)
+	function OnEnd(input)
 		if input ~= ActiveInput then return end
 
 		pressing = false
 		ActiveInput = nil
 		DragInput = nil
+		Detach(MoveHub, OnMove)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, Cancel)
 
 		Callback(Count, GetPosition(input), false, false, true)
-	end)
+	end
 
-	function self:SetLocked(Value)
+	function Self:SetLocked(Value)
 		Locked = Value
 
 		if Value then
@@ -1661,12 +1768,12 @@ function UIGesture:MakeLongPressable(Main, Handle, Callback, Config)
 		end
 	end
 
-	function self:Disconnect()
+	function Self:Disconnect()
 		DisconnectAll(Conn)
 		Cancel()
 	end
 
-	return Bind(self, Conn, Main, Handle)
+	return Bind(Self, Conn, Main, Handle)
 end
 
 function UIGesture:MakeDoubleTappable(Main, Handle, Callback, Config)
@@ -1687,8 +1794,10 @@ function UIGesture:MakeDoubleTappable(Main, Handle, Callback, Config)
 	local TapCount = 0
 	local ActiveInput, StartPos, StartTime, LastTapTime, LastTapPos
 
+	local OnEnd, OnFocus
+
 	local Conn = {}
-	local self = {}
+	local Self = {}
 
 	local function Expire(Reason)
 		if not LastTapTime then return end
@@ -1709,21 +1818,24 @@ function UIGesture:MakeDoubleTappable(Main, Handle, Callback, Config)
 		end
 
 		ActiveInput = input
+		Attach(EndHub, OnEnd)
+		Attach(FocusHub, OnFocus)
 		Interrupted = false
 		StartPos = input.Position
-		StartTime = os.clock()
+		StartTime = OsClock()
 	end)
 
-	Conn[2] = Listen(InputEndedListeners, function(input)
+	function OnEnd(input)
 		if input ~= ActiveInput then return end
 		ActiveInput = nil
+		Detach(EndHub, OnEnd)
 
-		if Interrupted or os.clock() - StartTime > MaxHoldTime or (input.Position - StartPos).Magnitude > MoveTolerance then
+		if Interrupted or OsClock() - StartTime > MaxHoldTime or (input.Position - StartPos).Magnitude > MoveTolerance then
 			Expire("Broken")
 			return
 		end
 
-		local Position = Vector2.new(input.Position.X, input.Position.Y)
+		local Position = Vector2New(input.Position.X, input.Position.Y)
 
 		if TapCount > 0 and StartTime - LastTapTime <= MaxInterval and (Position - LastTapPos).Magnitude <= MaxDistance then
 			TapCount += 1
@@ -1742,7 +1854,7 @@ function UIGesture:MakeDoubleTappable(Main, Handle, Callback, Config)
 			return
 		end
 
-		local TapTime = os.clock()
+		local TapTime = OsClock()
 		LastTapTime = TapTime
 		LastTapPos = Position
 
@@ -1753,25 +1865,29 @@ function UIGesture:MakeDoubleTappable(Main, Handle, Callback, Config)
 				Expire("Timeout")
 			end
 		end)
-	end)
+	end
 
-	Conn[3] = Listen(FocusLostListeners, function()
+	function OnFocus()
 		ActiveInput = nil
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, OnFocus)
 		Expire("Broken")
-	end)
+	end
 
-	function self:SetLocked(Value)
+	function Self:SetLocked(Value)
 		Locked = Value
 		ActiveInput = nil
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, OnFocus)
 		Expire("Locked")
 	end
 
-	function self:Disconnect()
+	function Self:Disconnect()
 		DisconnectAll(Conn)
-		self:SetLocked(true)
+		Self:SetLocked(true)
 	end
 
-	return Bind(self, Conn, Main, Handle)
+	return Bind(Self, Conn, Main, Handle)
 end
 
 function UIGesture:MakeTwoFingerRotatable(Main, Handle, Fn)
@@ -1782,61 +1898,70 @@ function UIGesture:MakeTwoFingerRotatable(Main, Handle, Fn)
 	local Touches = {}
 	local LastAngle
 
+	local OnEnd, OnFocus
+
 	local Conn = {}
-	local self = {}
+	local Self = {}
 
 	local function GetAngle()
 		local delta = Touches[2].Position - Touches[1].Position
-		return math.deg(math.atan2(delta.Y, delta.X))
+		return MathDeg(MathAtan2(delta.Y, delta.X))
 	end
 
-	Conn[1] = Handle.InputBegan:Connect(function(input)
-		if Locked or not AddTouch(Touches, input) then return end
-
-		rotating = true
-		LastAngle = GetAngle()
-
-		Call(Fn, true)
-	end)
-
-	Conn[2] = Listen(InputChangedListeners, function(input)
+	local function OnMove(input)
 		if not rotating or (input ~= Touches[1] and input ~= Touches[2]) then return end
 
 		local Angle = GetAngle()
 		Main.Rotation += (Angle - LastAngle + 180) % 360 - 180
 		LastAngle = Angle
+	end
+
+	Conn[1] = Handle.InputBegan:Connect(function(input)
+		if Locked or not AddTouch(Touches, input, OnEnd, OnFocus) then return end
+
+		rotating = true
+		Attach(MoveHub, OnMove)
+		LastAngle = GetAngle()
+
+		if Fn then Fn(true) end
 	end)
 
-	Conn[3] = Listen(InputEndedListeners, function(input)
-		if not RemoveTouch(Touches, input) or not rotating then return end
+	function OnEnd(input)
+		if not RemoveTouch(Touches, input, OnEnd, OnFocus) or not rotating then return end
 
 		rotating = false
+		Detach(MoveHub, OnMove)
 
-		Call(Fn, false)
-	end)
+		if Fn then Fn(false) end
+	end
 
-	Conn[4] = Listen(FocusLostListeners, function()
-		table.clear(Touches)
-		self:SetLocked(Locked)
-	end)
+	function OnFocus()
+		TableClear(Touches)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, OnFocus)
+		Self:SetLocked(Locked)
+	end
 
-	function self:SetLocked(Value)
+	function Self:SetLocked(Value)
 		Locked = Value
 
 		if rotating then
 			rotating = false
+			Detach(MoveHub, OnMove)
 
-			Call(Fn, false)
+			if Fn then Fn(false) end
 		end
 	end
 
-	function self:Disconnect()
+	function Self:Disconnect()
 		DisconnectAll(Conn)
-		table.clear(Touches)
-		self:SetLocked(true)
+		TableClear(Touches)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, OnFocus)
+		Self:SetLocked(true)
 	end
 
-	return Bind(self, Conn, Main, Handle)
+	return Bind(Self, Conn, Main, Handle)
 end
 
 function UIGesture:MakeTwoFingerTappable(Main, Handle, Callback, Config)
@@ -1853,18 +1978,12 @@ function UIGesture:MakeTwoFingerTappable(Main, Handle, Callback, Config)
 	local Touches = {}
 	local StartTime, StartPositions
 
+	local OnEnd, OnFocus
+
 	local Conn = {}
-	local self = {}
+	local Self = {}
 
-	Conn[1] = Handle.InputBegan:Connect(function(input)
-		if Locked or not AddTouch(Touches, input) then return end
-
-		Armed = true
-		StartTime = os.clock()
-		StartPositions = { Touches[1].Position, Touches[2].Position }
-	end)
-
-	Conn[2] = Listen(InputChangedListeners, function(input)
+	local function OnMove(input)
 		if not Armed or (input ~= Touches[1] and input ~= Touches[2]) then return end
 
 		for Index = 1, 2 do
@@ -1872,37 +1991,57 @@ function UIGesture:MakeTwoFingerTappable(Main, Handle, Callback, Config)
 				Armed = false
 			end
 		end
-	end)
-
-	Conn[3] = Listen(InputEndedListeners, function(input)
-		if not RemoveTouch(Touches, input) or not Armed then return end
-
-		Armed = false
-
-		if os.clock() - StartTime <= MaxHoldTime then
-			local Mid = (StartPositions[1] + StartPositions[2]) / 2
-
-			Callback(Vector2.new(Mid.X, Mid.Y))
-		end
-	end)
-
-	Conn[4] = Listen(FocusLostListeners, function()
-		table.clear(Touches)
-		Armed = false
-	end)
-
-	function self:SetLocked(Value)
-		Locked = Value
-		Armed = false
 	end
 
-	function self:Disconnect()
+	Conn[1] = Handle.InputBegan:Connect(function(input)
+		if Locked or not AddTouch(Touches, input, OnEnd, OnFocus) then return end
+
+		Armed = true
+		Attach(MoveHub, OnMove)
+		StartTime = OsClock()
+		StartPositions = { Touches[1].Position, Touches[2].Position }
+	end)
+
+	function OnEnd(input)
+		if not RemoveTouch(Touches, input, OnEnd, OnFocus) then return end
+
+		Detach(MoveHub, OnMove)
+
+		if not Armed then return end
+
 		Armed = false
-		table.clear(Touches)
+
+		if OsClock() - StartTime <= MaxHoldTime then
+			local Mid = (StartPositions[1] + StartPositions[2]) / 2
+
+			Callback(Vector2New(Mid.X, Mid.Y))
+		end
+	end
+
+	function OnFocus()
+		TableClear(Touches)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, OnFocus)
+		Armed = false
+		Detach(MoveHub, OnMove)
+	end
+
+	function Self:SetLocked(Value)
+		Locked = Value
+		Armed = false
+		Detach(MoveHub, OnMove)
+	end
+
+	function Self:Disconnect()
+		Armed = false
+		Detach(MoveHub, OnMove)
+		TableClear(Touches)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, OnFocus)
 		DisconnectAll(Conn)
 	end
 
-	return Bind(self, Conn, Main, Handle)
+	return Bind(Self, Conn, Main, Handle)
 end
 
 function UIGesture:MakeTwoFingerPannable(Main, Handle, Fn, Config)
@@ -1917,33 +2056,23 @@ function UIGesture:MakeTwoFingerPannable(Main, Handle, Fn, Config)
 	local Touches = {}
 	local StartMid, StartPos, StartScale, LastOffset
 
+	local OnEnd, OnFocus
+
 	local Conn = {}
-	local self = {}
+	local Self = {}
 
 	local function GetMid()
 		local Mid = (Touches[1].Position + Touches[2].Position) / 2
-		return Vector2.new(Mid.X, Mid.Y)
+		return Vector2New(Mid.X, Mid.Y)
 	end
 
-	Conn[1] = Handle.InputBegan:Connect(function(input)
-		if Locked or not AddTouch(Touches, input) then return end
-
-		Panning = true
-		StartMid = GetMid()
-		StartPos = Main.Position
-		StartScale = GetAncestorScale(Main.Parent)
-		LastOffset = Vector2.new(0, 0)
-
-		Call(Fn, LastOffset, true)
-	end)
-
-	Conn[2] = Listen(InputChangedListeners, function(input)
+	local function OnMove(input)
 		if not Panning or (input ~= Touches[1] and input ~= Touches[2]) then return end
 
 		LastOffset = GetMid() - StartMid
 
 		if MoveMain then
-			Main.Position = UDim2.new(
+			Main.Position = UDim2New(
 				StartPos.X.Scale,
 				StartPos.X.Offset + LastOffset.X / StartScale,
 				StartPos.Y.Scale,
@@ -1951,39 +2080,58 @@ function UIGesture:MakeTwoFingerPannable(Main, Handle, Fn, Config)
 			)
 		end
 
-		Call(Fn, LastOffset, true)
+		if Fn then Fn(LastOffset, true) end
+	end
+
+	Conn[1] = Handle.InputBegan:Connect(function(input)
+		if Locked or not AddTouch(Touches, input, OnEnd, OnFocus) then return end
+
+		Panning = true
+		Attach(MoveHub, OnMove)
+		StartMid = GetMid()
+		StartPos = Main.Position
+		StartScale = GetAncestorScale(Main.Parent)
+		LastOffset = Vector2.zero
+
+		if Fn then Fn(LastOffset, true) end
 	end)
 
-	Conn[3] = Listen(InputEndedListeners, function(input)
-		if not RemoveTouch(Touches, input) or not Panning then return end
+	function OnEnd(input)
+		if not RemoveTouch(Touches, input, OnEnd, OnFocus) or not Panning then return end
 
 		Panning = false
+		Detach(MoveHub, OnMove)
 
-		Call(Fn, LastOffset, false)
-	end)
+		if Fn then Fn(LastOffset, false) end
+	end
 
-	Conn[4] = Listen(FocusLostListeners, function()
-		table.clear(Touches)
-		self:SetLocked(Locked)
-	end)
+	function OnFocus()
+		TableClear(Touches)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, OnFocus)
+		Self:SetLocked(Locked)
+	end
 
-	function self:SetLocked(Value)
+	function Self:SetLocked(Value)
 		Locked = Value
 
 		if Panning then
 			Panning = false
+			Detach(MoveHub, OnMove)
 
-			Call(Fn, LastOffset, false)
+			if Fn then Fn(LastOffset, false) end
 		end
 	end
 
-	function self:Disconnect()
+	function Self:Disconnect()
 		DisconnectAll(Conn)
-		table.clear(Touches)
-		self:SetLocked(true)
+		TableClear(Touches)
+		Detach(EndHub, OnEnd)
+		Detach(FocusHub, OnFocus)
+		Self:SetLocked(true)
 	end
 
-	return Bind(self, Conn, Main, Handle)
+	return Bind(Self, Conn, Main, Handle)
 end
 
 return UIGesture
